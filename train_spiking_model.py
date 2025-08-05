@@ -1,79 +1,96 @@
-from urllib.request import urlretrieve
-
-import nengo 
-import tensorflow as tf 
-import numpy as np 
-import matplotlib.pyplot as plt
-
+import numpy as np
+import tensorflow as tf
+import nengo
 import nengo_dl
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, accuracy_score
 
-# Load the processed RF data
+# --- Load and preprocess data ---
 data = np.load("data/processed_rf_data.npz")
 X, Y = data["X"], data["Y"]
-
-
 Y = tf.keras.utils.to_categorical(Y, num_classes=4)
 
-# Reshape X to be suitable for repeated input over time (N, 1, D)
-X = X[:, None, :]
+# Increase simulation duration to improve spike integration
+n_steps = 90  # extended time window
+X = np.tile(X[:, None, :], (1, n_steps, 1))                # Shape: (batch, n_steps, features)
+Y = np.tile(Y[:, None, :], (1, n_steps, 1))                # Shape: (batch, n_steps, classes)
 
-# Define constants
-n_steps = 30       # simulation time steps per sample
+# --- Define model parameters ---
 n_input = X.shape[-1]
 n_hidden1 = 512
 n_hidden2 = 128
 n_classes = 4
+minibatch_size = 200
 
-# Define the Nengo model
+# --- Construct Nengo model with training-optimized LIF setup ---
 with nengo.Network(seed=0) as net:
-    # Set a global neuron default
-    nengo_dl.configure_settings(trainable=True)
+    neuron_type = nengo.LIF(amplitude=0.01)
+    net.config[nengo.Ensemble].neuron_type = neuron_type
+    net.config[nengo.Ensemble].max_rates = nengo.dists.Choice([100])
+    net.config[nengo.Ensemble].intercepts = nengo.dists.Choice([0])
+    net.config[nengo.Connection].synapse = None
+    nengo_dl.configure_settings(stateful=False)
 
-    # Input node (present constant vector for all time steps)
-    inp = nengo.Node(np.zeros(n_input))
+    # Input node with Gaussian noise
+    inp = nengo.Node(lambda t: np.zeros(n_input) + np.random.normal(0, 0.01, n_input))
 
-    # First LIF layer
-    x = nengo.Ensemble(n_neurons=n_hidden1, dimensions=1, neuron_type=nengo.LIF())
-    conn0 = nengo.Connection(inp, x.neurons, transform=np.random.randn(n_hidden1, n_input), synapse=None)
+    # First hidden layer
+    x = nengo_dl.Layer(neuron_type)(inp)
 
-    # Second LIF layer
-    y = nengo.Ensemble(n_neurons=n_hidden2, dimensions=1, neuron_type=nengo.LIF())
-    conn1 = nengo.Connection(x.neurons, y.neurons, transform=np.random.randn(n_hidden2, n_hidden1), synapse=None)
+    # Second hidden layer
+    y = nengo_dl.Layer(neuron_type)(x)
 
-    # Output layer (dense)
-    out = nengo.Node(size_in=n_classes)
-    conn2 = nengo.Connection(y.neurons, out, transform=np.random.randn(n_classes, n_hidden2), synapse=None)
+    # Optional third hidden layer
+    z = nengo_dl.Layer(neuron_type)(y)
+
+    # Dense output layer
+    out = nengo_dl.Layer(tf.keras.layers.Dense(units=n_classes))(z)
 
     # Probes
-    out_p = nengo.Probe(out, synapse=0.01)
+    out_p = nengo.Probe(out)
+    out_p_filt = nengo.Probe(out, synapse=0.01)
 
-# Wrap with NengoDL simulator
-minibatch_size = 200
+# --- Train using surrogate gradient approach ---
 with nengo_dl.Simulator(net, minibatch_size=minibatch_size, unroll_simulation=5) as sim:
-    # Repeat input across time steps
-    train_data = {inp: np.tile(X, (1, n_steps, 1))}
-    train_targets = {out_p: np.tile(Y[:, None, :], (1, n_steps, 1))}
+
+    # Custom temporal weighted cross-entropy loss
+    def weighted_cce(true, pred):
+        # true, pred shape: (batch, timesteps, classes)
+        time_weights = tf.linspace(0.1, 1.0, num=tf.shape(pred)[1])  # shape: (timesteps,)
+        time_weights = tf.reshape(time_weights, (1, -1, 1))          # shape: (1, timesteps, 1)
+
+        cce = tf.keras.losses.categorical_crossentropy(true, pred, from_logits=True)  # shape: (batch, timesteps)
+        cce = tf.expand_dims(cce, axis=-1)                                            # shape: (batch, timesteps, 1)
+
+        weighted_loss = cce * time_weights                                            # shape: (batch, timesteps, 1)
+        return tf.reduce_mean(weighted_loss)
 
 
-    # Compile and train
-    sim.compile(loss={out_p: tf.losses.CategoricalCrossentropy(from_logits=True)},
-                optimizer=tf.optimizers.Adam(1e-3),
-                metrics=["accuracy"])
-    sim.fit(train_data, train_targets, epochs=5)
+    sim.compile(
+        optimizer=tf.keras.optimizers.Adam(1e-4),
+        loss={out_p: weighted_cce},
+        metrics=["accuracy"]
+    )
 
-    # Save model
-    sim.save_params("./saved_model")
+    sim.fit({inp: X}, {out_p: Y}, epochs=30)
 
-    # Evaluate
-    test_output = sim.predict(train_data)[out_p]
-    predictions = np.mean(test_output, axis=1)
-    predicted_classes = np.argmax(predictions, axis=-1)
+    # Switch to true spiking LIF for inference
+    sim.freeze_params(net)
+    net.config[nengo.Ensemble].neuron_type = nengo.LIF()
+    test_output = sim.predict({inp: X})[out_p_filt]
 
-# Output a few prediction results
-import pandas as pd
+# --- Evaluate ---
+predictions = np.mean(test_output, axis=1)
+predicted_classes = np.argmax(predictions, axis=-1)
+true_classes = np.argmax(Y[:, 0, :], axis=-1)
 
-df = pd.DataFrame({
-    "True Label": np.argmax(Y, axis=-1),
-    "Predicted Label": predicted_classes
-})
-# tools.display_dataframe_to_user(name="Prediction Results", dataframe=df.head(30))
+cm = confusion_matrix(true_classes, predicted_classes)
+acc = accuracy_score(true_classes, predicted_classes)
+
+fig, ax = plt.subplots(figsize=(6, 6))
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=[0, 1, 2, 3])
+disp.plot(ax=ax, cmap="Blues", values_format='d')
+plt.title(f"Spiking SNN Confusion Matrix (Acc = {acc:.2f})")
+plt.tight_layout()
+plt.show()
