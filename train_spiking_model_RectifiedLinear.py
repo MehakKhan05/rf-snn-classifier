@@ -1,78 +1,89 @@
-from urllib.request import urlretrieve
-
-import nengo 
-import tensorflow as tf 
-import numpy as np 
+import numpy as np
+import tensorflow as tf
 import matplotlib.pyplot as plt
-
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, accuracy_score
+import nengo
 import nengo_dl
 
-# Load the processed RF data
+# === Load Data ===
 data = np.load("data/processed_rf_data.npz")
 X, Y = data["X"], data["Y"]
 Y = tf.keras.utils.to_categorical(Y, num_classes=4)
 
-# Reshape X to be suitable for repeated input over time (N, 1, D)
-X = X[:, None, :]
+# === Reshape for temporal input ===
+n_steps = 30
+X_reshaped = np.tile(X[:, None, :], (1, n_steps, 1))
+Y_reshaped = np.tile(Y[:, None, :], (1, n_steps, 1))
 
-# Define constants
-n_steps = 30       # simulation time steps per sample
+# === Model Params ===
 n_input = X.shape[-1]
 n_hidden1 = 512
 n_hidden2 = 128
 n_classes = 4
+minibatch_size = 200
 
-# Define the Nengo model
-with nengo.Network(seed=0) as net:
-    # Set a global neuron default
+# === Build ANN with ReLU ===
+with nengo.Network(seed=0) as ann_net:
     nengo_dl.configure_settings(trainable=True)
 
-    # Input node (present constant vector for all time steps)
     inp = nengo.Node(np.zeros(n_input))
 
-    # First LIF layer
-    x = nengo.Ensemble(n_neurons=n_hidden1, dimensions=1, neuron_type=nengo.RectifiedLinear())
-    conn0 = nengo.Connection(inp, x.neurons, transform=np.random.randn(n_hidden1, n_input)*0.1, synapse=None)
+    # Use tf.keras layers with NengoDL
+    x = nengo_dl.Layer(tf.keras.layers.Dense(units=n_hidden1))(inp)
+    x = nengo_dl.Layer(tf.keras.layers.ReLU())(x)
 
-    # Second LIF layer
-    y = nengo.Ensemble(n_neurons=n_hidden2, dimensions=1, neuron_type=nengo.RectifiedLinear())
-    conn1 = nengo.Connection(x.neurons, y.neurons, transform=np.random.randn(n_hidden2, n_hidden1)*0.1, synapse=0.01)
+    y = nengo_dl.Layer(tf.keras.layers.Dense(units=n_hidden2))(x)
+    y = nengo_dl.Layer(tf.keras.layers.ReLU())(y)
 
-    # Output layer (dense)
-    out = nengo.Node(size_in=n_classes)
-    conn2 = nengo.Connection(y.neurons, out, transform=np.random.randn(n_classes, n_hidden2)*0.1, synapse=0.01)
+    out = nengo_dl.Layer(tf.keras.layers.Dense(units=n_classes))(y)
 
-    # Probes
+    out_p = nengo.Probe(out)
+
+# === Train ANN ===
+with nengo_dl.Simulator(ann_net, minibatch_size=minibatch_size, unroll_simulation=5) as sim:
+    sim.compile(
+        optimizer=tf.keras.optimizers.Adam(1e-3),
+        loss={out_p: tf.keras.losses.CategoricalCrossentropy(from_logits=True)},
+        metrics=["accuracy"]
+    )
+
+    sim.fit(
+        {inp: X_reshaped},
+        {out_p: Y_reshaped},
+        epochs=30
+    )
+
+    sim.save_params("saved_ann_params")
+
+# === Convert to Spiking Model (LIF neurons) ===
+with nengo.Network(seed=0) as snn_net:
+    nengo_dl.configure_settings(trainable=True)
+
+    inp = nengo.Node(np.zeros(n_input))
+
+    x = nengo_dl.Layer(nengo.LIF())(inp, size_in=n_input, size_out=n_hidden1)
+    y = nengo_dl.Layer(nengo.LIF())(x, size_in=n_hidden1, size_out=n_hidden2)
+    out = nengo_dl.Layer(tf.keras.layers.Dense(units=n_classes))(y)
+
     out_p = nengo.Probe(out, synapse=0.01)
 
-# Wrap with NengoDL simulator
-minibatch_size = 200
-with nengo_dl.Simulator(net, minibatch_size=minibatch_size, unroll_simulation=5) as sim:
-    # Repeat input across time steps
-    train_data = {inp: np.tile(X, (1, n_steps, 1))}
-    train_targets = {out_p: np.tile(Y[:, None, :], (1, n_steps, 1))}
+# === Load weights and evaluate SNN ===
+with nengo_dl.Simulator(snn_net, minibatch_size=minibatch_size, unroll_simulation=5) as sim:
+    sim.load_params("saved_ann_params")
 
+    output = sim.predict({inp: X_reshaped})[out_p]
+    predictions = np.mean(output, axis=1)
 
-    # Compile and train
-    sim.compile(
-        loss={out_p: tf.losses.CategoricalCrossentropy(from_logits=True)},
-        optimizer=tf.optimizers.Adam(1e-3),
-        metrics=["accuracy"])
-    sim.fit(train_data, train_targets, epochs=30)
-
-    # Save model
-    sim.save_params("./saved_model")
-
-    # Evaluate
-    test_output = sim.predict(train_data)[out_p]
-    predictions = np.mean(test_output, axis=1)
     predicted_classes = np.argmax(predictions, axis=-1)
+    true_classes = np.argmax(Y, axis=-1)
 
-# Output a few prediction results
-import pandas as pd
+    acc = accuracy_score(true_classes, predicted_classes)
+    cm = confusion_matrix(true_classes, predicted_classes)
 
-df = pd.DataFrame({
-    "True Label": np.argmax(Y, axis=-1),
-    "Predicted Label": predicted_classes
-})
-# tools.display_dataframe_to_user(name="Prediction Results", dataframe=df.head(30))
+# === Plot Confusion Matrix ===
+fig, ax = plt.subplots(figsize=(6, 6))
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=[0, 1, 2, 3])
+disp.plot(ax=ax, cmap="Blues", values_format='d')
+plt.title(f"Spiking SNN Confusion Matrix (Acc = {acc:.2f})")
+plt.tight_layout()
+plt.show()
